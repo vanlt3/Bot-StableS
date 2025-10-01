@@ -406,7 +406,7 @@ ENABLE_REALTIME_MONITORING = True   # Enable real-time price monitoring for SL/T
 REALTIME_CHECK_INTERVAL = 30        # Seconds between real-time price checks
 BOT_CYCLE_MODE = "HOURLY"            # Options: "HOURLY", "CONTINUOUS", "CUSTOM"
 BOT_CYCLE_INTERVAL = 3600            # Seconds between cycles (only used if BOT_CYCLE_MODE = "CUSTOM")
-ENABLE_WICK_DETECTION = True        # Check candle wicks/shadows for SL/TP hits
+ENABLE_WICK_DETECTION = False       # Check candle wicks/shadows for SL/TP hits
 WICK_DETECTION_CANDLES = 3          # Number of recent candles to check for wicks
 MAX_REALTIME_RETRIES = 3            # Max retries for real-time price fetching
 REALTIME_TIMEOUT = 10               # Timeout in seconds for real-time API calls
