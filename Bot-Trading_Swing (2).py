@@ -15627,6 +15627,11 @@ class MasterAgent:
         self.trailing_stop_decisions = {}
         self.performance_metrics = {}
         
+        # NEW: Decision state management to prevent contradictions
+        self.decision_state = {}  # Track decisions per symbol
+        self.agent_vote_history = {}  # Track agent voting patterns
+        self.decision_timestamps = {}  # Track when decisions were made
+        
         # Initialize specialist agents for analysis
         self.initialize_specialist_agents()
         
@@ -15634,6 +15639,13 @@ class MasterAgent:
         self.min_risk_reward_ratio = 1.5
         self.max_risk_reward_ratio = 5.0
         self.trailing_activation_profit_threshold = 0.015  # 1.5%
+        
+        # NEW: Consensus thresholds to prevent weak decisions
+        self.consensus_thresholds = {
+            'strong_consensus': 0.67,  # 67% agreement required for strong consensus
+            'minimum_confidence': 0.50,  # Minimum confidence to proceed
+            'price_action_threshold': 0.15  # Minimum price action score
+        }
         
         # Learning parameters - weights for different factors
         self.decision_weights = {
@@ -15925,67 +15937,252 @@ class MasterAgent:
         """
         The final entry decision method, synthesizing multiple sources.
         Returns a dictionary with the decision and justification.
+        
+        ENHANCED: Now includes state management and validation to prevent contradictions
         """
         print(f"🎯 [Master Agent] Analyzing ENTRY for {base_signal} {symbol} (Confidence: {base_confidence:.2%})")
+        
+        # STEP 1: Validate if we should even proceed with analysis
+        validation_result = self._validate_decision_preconditions(symbol, base_signal, base_confidence)
+        if not validation_result['should_proceed']:
+            print(f"⚠️ [Master Agent] Pre-validation failed: {validation_result['reason']}")
+            return {
+                "decision": "REJECT",
+                "justification": validation_result['reason'],
+                "confidence": 0.0
+            }
         
         agent_opinions = {}
         agent_confidences = {}
         
-        # Run specialist agents
+        # STEP 2: Run specialist agents with error tracking
+        agent_errors = []
         for agent_name, agent in self.specialist_agents.items():
             try:
                 opinion, confidence = agent.analyze(market_data['price_data'], symbol)
                 agent_opinions[agent_name] = opinion
                 agent_confidences[agent_name] = confidence
+                print(f"   ✓ {agent_name}: {opinion} ({confidence:.2%})")
             except Exception as e:
                 print(f"❌ Error running {agent_name}: {e}")
                 agent_opinions[agent_name] = "HOLD"
                 agent_confidences[agent_name] = 0.5
-                
-        # Synthesize opinions
+                agent_errors.append(agent_name)
+        
+        # STEP 3: Calculate consensus with proper validation
+        total_agents = len(agent_opinions)
         buy_votes = sum(conf for agent, op in agent_opinions.items() if op == "BUY" for conf in [agent_confidences[agent]])
         sell_votes = sum(conf for agent, op in agent_opinions.items() if op == "SELL" for conf in [agent_confidences[agent]])
-
-        # Analyze market structure - need to access bot instance for this
-        # We'll pass this as part of market_data or calculate it here
-        pa_score = 0.0
-        if 'pa_score' in market_data:
-            pa_score = market_data['pa_score']
+        hold_votes = sum(conf for agent, op in agent_opinions.items() if op == "HOLD" for conf in [agent_confidences[agent]])
+        total_votes = buy_votes + sell_votes + hold_votes
         
-        # Final decision logic
+        # Calculate consensus percentage
+        consensus_metrics = {
+            'buy_ratio': buy_votes / total_votes if total_votes > 0 else 0,
+            'sell_ratio': sell_votes / total_votes if total_votes > 0 else 0,
+            'hold_ratio': hold_votes / total_votes if total_votes > 0 else 0,
+            'total_agents': total_agents,
+            'failed_agents': len(agent_errors)
+        }
+        
+        print(f"📊 [Master Agent] Consensus Metrics:")
+        print(f"   BUY: {consensus_metrics['buy_ratio']:.2%} ({buy_votes:.2f})")
+        print(f"   SELL: {consensus_metrics['sell_ratio']:.2%} ({sell_votes:.2f})")
+        print(f"   HOLD: {consensus_metrics['hold_ratio']:.2%} ({hold_votes:.2f})")
+
+        # STEP 4: Analyze market structure
+        pa_score = market_data.get('pa_score', 0.0)
+        
+        # STEP 5: Apply decision logic with state validation
+        decision_result = self._make_validated_decision(
+            symbol=symbol,
+            base_signal=base_signal,
+            base_confidence=base_confidence,
+            agent_opinions=agent_opinions,
+            consensus_metrics=consensus_metrics,
+            pa_score=pa_score,
+            buy_votes=buy_votes,
+            sell_votes=sell_votes
+        )
+        
+        # STEP 6: Store decision state for future validation
+        decision_result['signal'] = base_signal  # Store the original signal
+        self._store_decision_state(symbol, decision_result, agent_opinions, consensus_metrics)
+        
+        print(f"✅ [Master Agent] Decision: {decision_result['decision']}")
+        print(f"📝 [Master Agent] Justification: {decision_result['justification']}")
+        
+        return decision_result
+    
+    def _validate_decision_preconditions(self, symbol, base_signal, base_confidence):
+        """
+        Validate preconditions before making a decision
+        Prevents contradictory decisions
+        """
+        # Check if we have a recent decision for this symbol
+        if symbol in self.decision_state:
+            last_decision = self.decision_state[symbol]
+            time_since_last = (datetime.now() - last_decision['timestamp']).total_seconds()
+            
+            # If recent decision exists (within 60 seconds), validate consistency
+            if time_since_last < 60:
+                if last_decision['signal'] == base_signal and last_decision['decision'] == 'REJECT':
+                    return {
+                        'should_proceed': False,
+                        'reason': f"Recently rejected {base_signal} signal {time_since_last:.0f}s ago. Market conditions haven't changed significantly."
+                    }
+        
+        # Check minimum confidence
+        if base_confidence < self.consensus_thresholds['minimum_confidence']:
+            return {
+                'should_proceed': False,
+                'reason': f"Base confidence {base_confidence:.2%} below minimum threshold {self.consensus_thresholds['minimum_confidence']:.2%}"
+            }
+        
+        return {'should_proceed': True, 'reason': ''}
+    
+    def _make_validated_decision(self, symbol, base_signal, base_confidence, agent_opinions, 
+                                 consensus_metrics, pa_score, buy_votes, sell_votes):
+        """
+        Make a validated decision with proper consensus checking
+        """
         final_decision = "HOLD"
         justification = []
-
+        decision_confidence = base_confidence
+        
+        # Get thresholds
+        strong_consensus = self.consensus_thresholds['strong_consensus']
+        pa_threshold = self.consensus_thresholds['price_action_threshold']
+        
         if base_signal == "BUY":
-            if buy_votes > sell_votes * 1.5 and pa_score > 0.1:
+            # Check for strong consensus
+            has_strong_consensus = consensus_metrics['buy_ratio'] >= strong_consensus
+            has_weak_opposition = consensus_metrics['sell_ratio'] < 0.2
+            has_favorable_pa = pa_score > pa_threshold
+            
+            # Decision matrix
+            if has_strong_consensus and has_favorable_pa:
                 final_decision = "APPROVE"
-                justification.append(f"Strong consensus from specialist agents (Buy Score: {buy_votes:.2f}).")
-                justification.append(f"Favorable Price Action (Score: {pa_score:.2f}).")
+                justification.append(f"Strong consensus ({consensus_metrics['buy_ratio']:.1%} agreement)")
+                justification.append(f"Favorable price action (Score: {pa_score:.2f})")
+                decision_confidence = min(0.95, base_confidence * 1.2)
+            elif has_strong_consensus and not has_favorable_pa:
+                final_decision = "WAIT"
+                justification.append(f"Strong consensus but unfavorable price action (Score: {pa_score:.2f})")
+                justification.append("Recommend waiting for better entry")
+                decision_confidence = base_confidence * 0.8
+            elif not has_strong_consensus and has_favorable_pa:
+                final_decision = "REJECT"
+                justification.append(f"Weak consensus (only {consensus_metrics['buy_ratio']:.1%} agreement)")
+                justification.append(f"BUY votes: {buy_votes:.2f} vs SELL votes: {sell_votes:.2f}")
+                decision_confidence = base_confidence * 0.6
             else:
                 final_decision = "REJECT"
-                justification.append(f"Weak consensus (Buy Score: {buy_votes:.2f} vs Sell Score: {sell_votes:.2f}).")
-                if pa_score <= 0.1:
-                    justification.append(f"Unfavorable Price Action (Score: {pa_score:.2f}).")
+                justification.append(f"Weak consensus ({consensus_metrics['buy_ratio']:.1%}) AND unfavorable price action ({pa_score:.2f})")
+                decision_confidence = base_confidence * 0.5
 
         elif base_signal == "SELL":
-            if sell_votes > buy_votes * 1.5 and pa_score < -0.1:
+            # Check for strong consensus
+            has_strong_consensus = consensus_metrics['sell_ratio'] >= strong_consensus
+            has_weak_opposition = consensus_metrics['buy_ratio'] < 0.2
+            has_favorable_pa = pa_score < -pa_threshold
+            
+            # Decision matrix
+            if has_strong_consensus and has_favorable_pa:
                 final_decision = "APPROVE"
-                justification.append(f"Strong consensus from specialist agents (Sell Score: {sell_votes:.2f}).")
-                justification.append(f"Favorable Price Action (Score: {pa_score:.2f}).")
+                justification.append(f"Strong consensus ({consensus_metrics['sell_ratio']:.1%} agreement)")
+                justification.append(f"Favorable price action (Score: {pa_score:.2f})")
+                decision_confidence = min(0.95, base_confidence * 1.2)
+            elif has_strong_consensus and not has_favorable_pa:
+                final_decision = "WAIT"
+                justification.append(f"Strong consensus but unfavorable price action (Score: {pa_score:.2f})")
+                justification.append("Recommend waiting for better entry")
+                decision_confidence = base_confidence * 0.8
+            elif not has_strong_consensus and has_favorable_pa:
+                final_decision = "REJECT"
+                justification.append(f"Weak consensus (only {consensus_metrics['sell_ratio']:.1%} agreement)")
+                justification.append(f"SELL votes: {sell_votes:.2f} vs BUY votes: {buy_votes:.2f}")
+                decision_confidence = base_confidence * 0.6
             else:
                 final_decision = "REJECT"
-                justification.append(f"Weak consensus (Sell Score: {sell_votes:.2f} vs Buy Score: {buy_votes:.2f}).")
-                if pa_score >= -0.1:
-                    justification.append(f"Unfavorable Price Action (Score: {pa_score:.2f}).")
-
-        print(f"✅ [Master Agent] Decision: {final_decision}")
-        print(f"📝 [Master Agent] Justification: {' '.join(justification)}")
+                justification.append(f"Weak consensus ({consensus_metrics['sell_ratio']:.1%}) AND unfavorable price action ({pa_score:.2f})")
+                decision_confidence = base_confidence * 0.5
         
         return {
             "decision": final_decision,
             "justification": " ".join(justification),
-            "confidence": base_confidence
+            "confidence": decision_confidence,
+            "consensus_metrics": consensus_metrics
         }
+    
+    def _store_decision_state(self, symbol, decision_result, agent_opinions, consensus_metrics):
+        """
+        Store decision state for audit trail and future validation
+        """
+        self.decision_state[symbol] = {
+            'timestamp': datetime.now(),
+            'decision': decision_result['decision'],
+            'signal': decision_result.get('signal', 'UNKNOWN'),
+            'justification': decision_result['justification'],
+            'confidence': decision_result['confidence'],
+            'agent_opinions': agent_opinions.copy(),
+            'consensus_metrics': consensus_metrics.copy()
+        }
+        
+        # Store agent vote history
+        if symbol not in self.agent_vote_history:
+            self.agent_vote_history[symbol] = []
+        
+        self.agent_vote_history[symbol].append({
+            'timestamp': datetime.now(),
+            'opinions': agent_opinions.copy(),
+            'decision': decision_result['decision']
+        })
+        
+        # Keep only last 10 decisions per symbol
+        if len(self.agent_vote_history[symbol]) > 10:
+            self.agent_vote_history[symbol] = self.agent_vote_history[symbol][-10:]
+    
+    def get_decision_history(self, symbol, limit=5):
+        """
+        Get recent decision history for audit and analysis
+        """
+        if symbol not in self.agent_vote_history:
+            return []
+        
+        history = self.agent_vote_history[symbol][-limit:]
+        return [
+            {
+                'timestamp': entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'decision': entry['decision'],
+                'opinions': entry['opinions']
+            }
+            for entry in history
+        ]
+    
+    def detect_decision_pattern_issues(self, symbol):
+        """
+        Detect potential issues in decision patterns
+        Returns warnings if contradictory patterns are found
+        """
+        if symbol not in self.agent_vote_history or len(self.agent_vote_history[symbol]) < 3:
+            return []
+        
+        warnings = []
+        recent_decisions = self.agent_vote_history[symbol][-5:]
+        
+        # Check for flip-flopping (APPROVE -> REJECT -> APPROVE in short time)
+        if len(recent_decisions) >= 3:
+            last_three = [d['decision'] for d in recent_decisions[-3:]]
+            if last_three[0] != 'REJECT' and last_three[1] == 'REJECT' and last_three[2] != 'REJECT':
+                warnings.append("⚠️ Decision flip-flopping detected")
+        
+        # Check for repeated rejections with same opinions
+        rejection_count = sum(1 for d in recent_decisions if d['decision'] == 'REJECT')
+        if rejection_count >= 3:
+            warnings.append(f"⚠️ {rejection_count} recent rejections - consider reviewing conditions")
+        
+        return warnings
 
     def decide_trailing_stop_activation(self, symbol, current_price, entry_price, direction, market_data):
         """
