@@ -19103,8 +19103,15 @@ class EnhancedTradingBot:
             return {'rl': 0.3, 'master': 0.3, 'ensemble': 0.2, 'online': 0.2}
     
     def _combine_decisions_unified(self, rl_action, rl_confidence, master_action, master_confidence, ensemble_action, ensemble_confidence, online_action, online_confidence, symbol):
-        """Production-grade unified decision combination using ProductionConfidenceManager"""
+        """Production-grade unified decision combination with Master Agent priority"""
         try:
+            # MASTER AGENT PRIORITY: If Master Agent has high confidence, respect its decision
+            if master_confidence >= 0.5:  # Master Agent confident threshold
+                logger = BOT_LOGGERS.get('RLStrategy', logging.getLogger())
+                logger.info(f" [Master Agent Priority] {symbol}: Master Agent decision {master_action} ({master_confidence:.2%}) takes priority")
+                return master_action, master_confidence
+            
+            # If Master Agent not confident enough, use weighted consensus
             # Prepare signals for the new confidence manager
             signals = {
                 'rl': {'action': rl_action, 'confidence': rl_confidence},
@@ -19135,17 +19142,20 @@ class EnhancedTradingBot:
             
             # Log the decision with method used
             logger = BOT_LOGGERS.get('RLStrategy', logging.getLogger())
-            logger.info(f" [Production Confidence] {symbol}: {final_decision} ({final_confidence:.2%}) via {method_used}")
+            logger.info(f" [Weighted Consensus] {symbol}: {final_decision} ({final_confidence:.2%}) via {method_used}")
             
             return final_decision, final_confidence
             
         except Exception as e:
             logging.error(f"Error combining unified decisions: {e}")
-            # Fallback to simple decision
-            all_actions = [rl_action, master_action, ensemble_action, online_action]
-            most_common = max(set(all_actions), key=all_actions.count)
-            avg_confidence = (rl_confidence + master_confidence + ensemble_confidence + online_confidence) / 4
-            return most_common, avg_confidence
+            # Fallback to Master Agent if available, otherwise simple decision
+            if master_confidence >= 0.3:  # Lower threshold for fallback
+                return master_action, master_confidence
+            else:
+                all_actions = [rl_action, master_action, ensemble_action, online_action]
+                most_common = max(set(all_actions), key=all_actions.count)
+                avg_confidence = (rl_confidence + master_confidence + ensemble_confidence + online_confidence) / 4
+                return most_common, avg_confidence
     
     def _calculate_volatility(self, symbol):
         """Calculate volatility for the symbol"""
@@ -21463,7 +21473,12 @@ class EnhancedTradingBot:
                             hold_message += f"**Symbol:** {symbol_to_act}\n"
                             hold_message += f"**Action:** HOLD (No Trade)\n"
                             hold_message += f"**Confidence:** {final_confidence:.2%}\n"
-                            hold_message += f"**Reason:** RL Agent recommends holding position\n\n"
+                            # Determine the actual reason based on decision logic
+                            if master_confidence >= 0.5:
+                                reason = f"Master Agent decision takes priority ({master_decision} at {master_confidence:.2%})"
+                            else:
+                                reason = "Weighted consensus recommends holding position"
+                            hold_message += f"**Reason:** {reason}\n\n"
                             hold_message += f"**Other Signals:**\n"
                             hold_message += f"• Master Agent: {master_decision} ({master_confidence:.2%})\n"
                             hold_message += f"• Ensemble: {ensemble_decision} ({ensemble_confidence:.2%})\n"
