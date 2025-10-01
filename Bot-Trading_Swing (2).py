@@ -1,4 +1,4 @@
-﻿# Standard library imports
+# Standard library imports
 print("🚀 [Bot] Starting imports...")
 
 # ==================================================
@@ -20965,7 +20965,7 @@ class EnhancedTradingBot:
 
                 # CRITICAL FIX: Ensure all symbols have the same number of features
                 # Use a fixed feature dimension for RL consistency
-                FIXED_FEATURE_DIM = self.portfolio_rl_agent.model.observation_space.shape[0] // (len(active_symbols_for_rl) + 1) - 3
+                FIXED_FEATURE_DIM = self.portfolio_rl_agent.model.observation_space.shape[0] // (len(active_symbols_to_process) + 1) - 3
                 
                 if market_obs is None:
                     market_obs = np.zeros(FIXED_FEATURE_DIM)
